@@ -3901,4 +3901,148 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       });
     }
   );
+
+  /* CVE-2026-109345: an IN_PLACE root that is itself force-removed during
+     the walk (a disallowed or forbidden root tag, an <svg>/<math> root
+     caught by the p/br mXSS check, ...) was handed back to the caller. The
+     main loop skips _sanitizeAttributes for nodes _sanitizeElements removed,
+     so such a root kept its attributes and its rawtext content uninspected.
+     sanitize() must fail closed instead of returning it. The roots are
+     attached to the document, like a caller sanitizing a live subtree. */
+  var wasRecordedAsRemoved = function (purify, node) {
+    for (var i = 0; i < purify.removed.length; i++) {
+      if (purify.removed[i].element === node) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+  var expectForceRemovedRootThrows = function (assert, dirty, cfg, label) {
+    var result = null;
+    document.body.appendChild(dirty);
+    try {
+      assert.throws(
+        function () {
+          result = DOMPurify.sanitize(dirty, cfg);
+        },
+        /refusing to sanitize in place/,
+        label + ': force-removed root is not returned'
+      );
+      assert.strictEqual(
+        result,
+        null,
+        label + ': no node is handed back to the caller'
+      );
+      assert.ok(
+        wasRecordedAsRemoved(DOMPurify, dirty),
+        label + ': root was recorded as removed during the aborted call'
+      );
+    } finally {
+      if (dirty.parentNode) {
+        dirty.parentNode.removeChild(dirty);
+      }
+
+      window.xssed = false;
+    }
+  };
+  QUnit.test(
+    'CVE-2026-109345: IN_PLACE throws instead of returning a force-removed rawtext root (mXSS reparse)',
+    function (assert) {
+      // A <noembed> is not allow-listed, so a <noembed> passed as the
+      // IN_PLACE root is force-removed by the walk. Its attributes (the
+      // onclick below) are never inspected, and its rawtext content is
+      // serialized literally, so re-serialising and re-parsing the returned
+      // node ("</noembed><img ...>") re-opens markup. Assert the return
+      // contract, not merely a scrubbed attribute, so a future refactor can
+      // not pass by defanging the root while still returning it.
+      var dirty = document.createElement('noembed');
+      dirty.setAttribute('onclick', 'alert(1)');
+      dirty.textContent = '</noembed><img src=x onerror=alert(1)>';
+      expectForceRemovedRootThrows(
+        assert,
+        dirty,
+        { IN_PLACE: true },
+        '<noembed> root'
+      );
+    }
+  );
+  QUnit.test(
+    'CVE-2026-109345: IN_PLACE throws instead of returning an <svg> root removed by the p/br mXSS check',
+    function (assert) {
+      // An <svg> root holding a <p> is force-removed as an mXSS candidate
+      // before its attributes are looked at, so its onclick survived.
+      var dirty = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      dirty.setAttribute('onclick', 'alert(1)');
+      dirty.appendChild(document.createElement('p'));
+      expectForceRemovedRootThrows(
+        assert,
+        dirty,
+        { IN_PLACE: true },
+        '<svg> root with a <p> descendant'
+      );
+    }
+  );
+  QUnit.test(
+    'CVE-2026-109345: IN_PLACE throws instead of returning a root whose tag is in FORBID_TAGS',
+    function (assert) {
+      // A forbidden root is removed, not attribute-sanitized, so its
+      // onclick survived on the returned node.
+      var dirty = document.createElement('div');
+      dirty.setAttribute('onclick', 'alert(1)');
+      expectForceRemovedRootThrows(
+        assert,
+        dirty,
+        { IN_PLACE: true, FORBID_TAGS: ['div'] },
+        'FORBID_TAGS root'
+      );
+    }
+  );
+  QUnit.test(
+    'CVE-2026-109345: IN_PLACE still returns the root when a dangerous CHILD (not the root) is removed',
+    function (assert) {
+      // The fail-closed guard must fire ONLY when the ROOT itself is
+      // force-removed. A dangerous rawtext child is detached from the
+      // returned root as usual; the root remains safe to return, so the
+      // guard must not over-trigger on ordinary child removals.
+      var dirty = document.createElement('div');
+      dirty.setAttribute('onclick', 'alert(1)');
+      dirty.innerHTML = '<span>ok</span>';
+      var noembed = document.createElement('noembed');
+      noembed.setAttribute('onclick', 'alert(2)');
+      noembed.textContent = '</noembed><img src=x onerror=alert(3)>';
+      dirty.appendChild(noembed);
+      document.body.appendChild(dirty);
+
+      try {
+        var clean = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+        assert.strictEqual(clean, dirty, 'returns the input root');
+        assert.strictEqual(
+          dirty.querySelector('noembed'),
+          null,
+          'dangerous rawtext child removed from the returned root'
+        );
+        assert.equal(
+          dirty.querySelector('span').textContent,
+          'ok',
+          'safe sibling content preserved'
+        );
+        assert.strictEqual(
+          dirty.getAttribute('onclick'),
+          null,
+          'the returned root is attribute-sanitized'
+        );
+        assert.ok(
+          wasRecordedAsRemoved(DOMPurify, noembed),
+          'the child was recorded as removed'
+        );
+      } finally {
+        if (dirty.parentNode) {
+          dirty.parentNode.removeChild(dirty);
+        }
+
+        window.xssed = false;
+      }
+    }
+  );
 };
